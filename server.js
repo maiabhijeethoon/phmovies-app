@@ -55,7 +55,7 @@ bcrypt.hash(admin_password, 10, (err, hash) => {
     });
 });
 
-// "requests" naam ka table banayein, ab user ID ke saath
+// "requests" naam ka table banayein, ab user email ke saath
 db.run(`CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     movie_name TEXT NOT NULL,
