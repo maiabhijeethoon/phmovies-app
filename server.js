@@ -6,7 +6,7 @@ const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // Database se connect hona
 const db = new sqlite3.Database('./movies.db', (err) => {
@@ -16,28 +16,35 @@ const db = new sqlite3.Database('./movies.db', (err) => {
     console.log('Connected to the movies database.');
 });
 
-// User table create karein
-db.run(`CREATE TABLE IF NOT EXISTS users (
+// Admin table (for internal admin panel)
+db.run(`CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL
 )`);
 
+// Regular users table (for user-facing login)
+db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL
+)`);
+
 // Admin user ko create karein agar woh exist nahi karta
-const username = 'admin';
-const password = 'password123';
-bcrypt.hash(password, 10, (err, hash) => {
+const admin_username = 'admin';
+const admin_password = 'password123';
+bcrypt.hash(admin_password, 10, (err, hash) => {
     if (err) {
         console.error(err.message);
         return;
     }
-    db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
+    db.get('SELECT * FROM admin_users WHERE username = ?', [admin_username], (err, row) => {
         if (err) {
             console.error(err.message);
             return;
         }
         if (!row) {
-            db.run('INSERT INTO users (username, password_hash) VALUES (?, ?)', [username, hash], (err) => {
+            db.run('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', [admin_username, hash], (err) => {
                 if (err) {
                     console.error(err.message);
                 } else {
@@ -48,7 +55,7 @@ bcrypt.hash(password, 10, (err, hash) => {
     });
 });
 
-// "requests" naam ka table banayein, ab "user_email" column ke saath
+// "requests" naam ka table banayein, ab user ID ke saath
 db.run(`CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     movie_name TEXT NOT NULL,
@@ -61,8 +68,8 @@ db.run(`CREATE TABLE IF NOT EXISTS requests (
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: 'csoutlier@gmail.com', // Yahan apni Gmail ID daalo
-        pass: 'myvk mkxb cxem owss'     // Yahan Google App Password daalo
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_PASS
     }
 });
 
@@ -70,239 +77,179 @@ const transporter = nodemailer.createTransport({
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, '')));
 app.use(session({
-    secret: 'your_secret_key_here',
+    secret: process.env.SESSION_SECRET,
     resave: false,
-    saveUninitialized: true
+    saveUninitialized: true,
+    cookie: {
+        maxAge: 1000 * 60 * 60 * 24 // 24 hours
+    }
 }));
 
-// Auth middleware function
-const isAuthenticated = (req, res, next) => {
-    if (req.session.loggedIn) {
+// Auth middleware function (for admin)
+const isAuthenticatedAdmin = (req, res, next) => {
+    if (req.session.adminLoggedIn) {
         return next();
     }
-    res.redirect('/login');
+    res.redirect('/admin/login');
+};
+
+// Auth middleware function (for user)
+const isAuthenticatedUser = (req, res, next) => {
+    if (req.session.userLoggedIn) {
+        return next();
+    }
+    res.redirect('/user/login');
 };
 
 // --- ROUTES ---
 
-// Default route to serve the HTML file
+// Main page route
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Route to handle movie requests and save to database
-app.post('/request-movie', (req, res) => {
-    const { movieName, userEmail } = req.body;
-    const sql = `INSERT INTO requests(movie_name, user_email) VALUES(?, ?)`;
-    db.run(sql, [movieName, userEmail], function(err) {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
-        console.log(`A new movie request for "${movieName}" from "${userEmail}" has been added.`);
-        const requestId = this.lastID;
-        res.send(`
+// --- USER AUTHENTICATION ROUTES ---
+
+// Signup page
+app.get('/user/signup', (req, res) => {
+    res.sendFile(path.join(__dirname, 'user_signup.html'));
+});
+
+// Signup post route
+app.post('/user/signup', (req, res) => {
+    const { email, password } = req.body;
+    bcrypt.hash(password, 10, (err, hash) => {
+        if (err) return res.status(500).send('Error hashing password.');
+        db.run('INSERT INTO users (email, password_hash) VALUES (?, ?)', [email, hash], (err) => {
+            if (err) {
+                if (err.message.includes('UNIQUE constraint failed')) {
+                    return res.send('This email is already registered. Please login.');
+                }
+                return res.status(500).send('Database error.');
+            }
+            res.send('Signup successful! Please <a href="/user/login">login</a>.');
+        });
+    });
+});
+
+// User login page
+app.get('/user/login', (req, res) => {
+    res.sendFile(path.join(__dirname, 'user_login.html'));
+});
+
+// User login post route
+app.post('/user/login', (req, res) => {
+    const { email, password } = req.body;
+    db.get('SELECT * FROM users WHERE email = ?', [email], (err, user) => {
+        if (err) return res.status(500).send('Database error.');
+        if (!user) return res.send('Invalid email or password.');
+
+        bcrypt.compare(password, user.password_hash, (err, result) => {
+            if (result) {
+                req.session.userLoggedIn = true;
+                req.session.userEmail = user.email;
+                res.redirect('/user/dashboard');
+            } else {
+                res.send('Invalid email or password.');
+            }
+        });
+    });
+});
+
+// User logout route
+app.get('/user/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) return console.error(err);
+        res.redirect('/user/login');
+    });
+});
+
+// --- USER DASHBOARD ---
+// User dashboard page
+app.get('/user/dashboard', isAuthenticatedUser, (req, res) => {
+    const userEmail = req.session.userEmail;
+    db.all('SELECT * FROM requests WHERE user_email = ? ORDER BY id DESC', [userEmail], (err, rows) => {
+        if (err) return res.status(500).send('Database error.');
+        
+        let html = `
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Request Submitted</title>
+                <title>My Dashboard</title>
                 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
                 <style>
-                    body { 
-                        font-family: 'Poppins', sans-serif; 
-                        text-align: center; 
-                        padding: 50px; 
-                        background-color: #f0f2f5; 
-                        display: flex; 
-                        justify-content: center; 
-                        align-items: center; 
-                        min-height: 100vh; 
-                        margin: 0;
-                    }
-                    .container { 
-                        background: white; 
-                        padding: 3em; 
-                        border-radius: 12px; 
-                        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); 
-                        display: inline-block; 
-                        animation: fadeIn 1s ease-out;
-                        max-width: 500px;
-                        width: 90%;
-                    }
-                    h1 { 
-                        color: #28a745; 
-                        margin-bottom: 20px; 
-                        font-weight: 600;
-                        animation: slideIn 0.8s ease-out;
-                    }
-                    p {
-                        color: #555;
-                        font-size: 1.1em;
-                        margin-bottom: 10px;
-                    }
-                    .status-link { 
-                        margin-top: 30px; 
-                        font-size: 1em;
-                    }
-                    a {
-                        display: inline-block;
-                        margin-top: 15px;
-                        padding: 10px 25px;
-                        background-color: #007bff;
-                        color: white;
-                        text-decoration: none;
-                        border-radius: 6px;
-                        transition: background-color 0.3s ease;
-                    }
-                    a:hover {
-                        background-color: #0056b3;
-                    }
-                    @keyframes fadeIn {
-                        from { opacity: 0; transform: translateY(20px); }
-                        to { opacity: 1; transform: translateY(0); }
-                    }
-                    @keyframes slideIn {
-                        from { opacity: 0; transform: translateX(-20px); }
-                        to { opacity: 1; transform: translateX(0); }
-                    }
+                    body { font-family: 'Poppins', sans-serif; background-color: #f0f2f5; margin: 0; padding: 2em; }
+                    .container { max-width: 900px; margin: auto; background: white; padding: 2em; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+                    h1 { text-align: center; color: #333; }
+                    .logout-btn { display: inline-block; padding: 8px 15px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 5px; }
+                    .request-form { margin-top: 2em; text-align: center; }
+                    .request-form input { width: 80%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
+                    .request-form button { padding: 10px 20px; background-color: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 1em; }
+                    th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+                    th { background-color: #007bff; color: white; }
+                    tr:nth-child(even) { background-color: #f2f2f2; }
+                    .status-pending { color: #ffc107; font-weight: bold; }
+                    .status-completed { color: #28a745; font-weight: bold; }
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>Request Submitted Successfully!</h1>
-                    <p>Thank you for your request for <b>"${movieName}"</b>!</p>
-                    <p>We will process it shortly.</p>
-                    <p class="status-link">You can check the status of your request here:</p>
-                    <a href="/status?id=${requestId}">Check Request Status</a>
+                    <a href="/user/logout" class="logout-btn">Logout</a>
+                    <h1>Welcome, ${req.session.userEmail}</h1>
+                    <p>Here are your movie requests:</p>
+                    
+                    <div class="request-form">
+                        <h2>Request a New Movie</h2>
+                        <form action="/request-movie" method="post">
+                            <input type="text" name="movieName" placeholder="Enter movie name" required>
+                            <button type="submit">Submit Request</button>
+                        </form>
+                    </div>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Movie</th>
+                                <th>Status</th>
+                                <th>Link</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rows.length > 0 ? rows.map(row => `
+                                <tr>
+                                    <td>${row.movie_name}</td>
+                                    <td><span class="status-${row.status}">${row.status.charAt(0).toUpperCase() + row.status.slice(1)}</span></td>
+                                    <td>${row.link ? `<a href="${row.link}">${row.link}</a>` : 'Not ready yet'}</td>
+                                </tr>
+                            `).join('') : `<tr><td colspan="3">You have no requests yet.</td></tr>`}
+                        </tbody>
+                    </table>
                 </div>
             </body>
             </html>
-        `);
+        `;
+        res.send(html);
     });
 });
 
-// Naya route: User ko request status dikhane ke liye (Ismein abhi design change nahi hua hai)
-app.get('/status', (req, res) => {
-    const requestId = req.query.id;
-    if (!requestId) {
-        return res.send('No request ID provided.');
-    }
+// --- ADMIN ROUTES ---
 
-    const sql = `SELECT movie_name, status, link FROM requests WHERE id = ?`;
-    db.get(sql, [requestId], (err, row) => {
-        if (err) {
-            return res.status(500).send('Database error.');
-        }
-        if (!row) {
-            return res.status(404).send('Request not found.');
-        }
-
-        let linkSection = '';
-        if (row.status === 'completed' && row.link) {
-            linkSection = `<p>Download link is ready: <a href="${row.link}">${row.link}</a></p>`;
-        }
-
-        // Updated HTML for the Status page
-        res.send(`
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Request Status</title>
-                <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-                <style>
-                    body { 
-                        font-family: 'Poppins', sans-serif; 
-                        text-align: center; 
-                        padding: 50px; 
-                        background-color: #f0f2f5; 
-                        display: flex; 
-                        justify-content: center; 
-                        align-items: center; 
-                        min-height: 100vh; 
-                        margin: 0;
-                    }
-                    .container { 
-                        background: white; 
-                        padding: 3em; 
-                        border-radius: 12px; 
-                        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); 
-                        display: inline-block; 
-                        animation: fadeIn 1s ease-out;
-                        max-width: 500px;
-                        width: 90%;
-                    }
-                    h1 { 
-                        color: #333; 
-                        margin-bottom: 20px; 
-                        font-weight: 600;
-                        animation: slideIn 0.8s ease-out;
-                    }
-                    p {
-                        color: #555;
-                        font-size: 1.1em;
-                        margin-bottom: 10px;
-                    }
-                    a {
-                        display: inline-block;
-                        margin-top: 15px;
-                        padding: 10px 25px;
-                        background-color: #007bff;
-                        color: white;
-                        text-decoration: none;
-                        border-radius: 6px;
-                        transition: background-color 0.3s ease;
-                    }
-                    a:hover {
-                        background-color: #0056b3;
-                    }
-                    .status-pending { color: #ffc107; }
-                    .status-completed { color: #28a745; }
-                    @keyframes fadeIn {
-                        from { opacity: 0; transform: translateY(20px); }
-                        to { opacity: 1; transform: translateY(0); }
-                    }
-                    @keyframes slideIn {
-                        from { opacity: 0; transform: translateX(-20px); }
-                        to { opacity: 1; transform: translateX(0); }
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>Request Status</h1>
-                    <p><b>Movie:</b> ${row.movie_name}</p>
-                    <p><b>Status:</b> <span class="status-${row.status}">${row.status.charAt(0).toUpperCase() + row.status.slice(1)}</span></p>
-                    ${linkSection}
-                </div>
-            </body>
-            </html>
-        `);
-    });
-});
-
-// Login page
-app.get('/login', (req, res) => {
+app.get('/admin/login', (req, res) => {
     res.sendFile(path.join(__dirname, 'login.html'));
 });
 
-// Login post route
-app.post('/login', (req, res) => {
+app.post('/admin/login', (req, res) => {
     const { username, password } = req.body;
-    db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
-        if (!user) {
-            return res.send('Invalid username or password.');
-        }
+    db.get('SELECT * FROM admin_users WHERE username = ?', [username], (err, user) => {
+        if (err) return res.status(500).send('Database error.');
+        if (!user) return res.send('Invalid username or password.');
+
         bcrypt.compare(password, user.password_hash, (err, result) => {
             if (result) {
-                req.session.loggedIn = true;
+                req.session.adminLoggedIn = true;
                 res.redirect('/admin');
             } else {
                 res.send('Invalid username or password.');
@@ -311,14 +258,10 @@ app.post('/login', (req, res) => {
     });
 });
 
-// Admin Panel route (ab password-protected hai)
-app.get('/admin', isAuthenticated, (req, res) => {
+app.get('/admin', isAuthenticatedAdmin, (req, res) => {
     const sql = `SELECT * FROM requests ORDER BY id DESC`;
     db.all(sql, [], (err, rows) => {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
+        if (err) return res.status(500).send('Database error.');
         let html = `
             <!DOCTYPE html>
             <html lang="en">
@@ -326,8 +269,9 @@ app.get('/admin', isAuthenticated, (req, res) => {
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Admin Dashboard</title>
+                <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
                 <style>
-                    body { font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 2em; }
+                    body { font-family: 'Poppins', sans-serif; background-color: #f0f2f5; margin: 0; padding: 2em; }
                     .container { max-width: 900px; margin: auto; background: white; padding: 2em; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
                     h1 { text-align: center; color: #333; }
                     table { width: 100%; border-collapse: collapse; margin-top: 1em; }
@@ -343,7 +287,7 @@ app.get('/admin', isAuthenticated, (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <a href="/logout">Logout</a>
+                    <a href="/admin/logout">Logout</a>
                     <h1>Admin Dashboard - Movie Requests</h1>
                     <table>
                         <thead>
@@ -398,75 +342,62 @@ app.get('/admin', isAuthenticated, (req, res) => {
     });
 });
 
-// Route to add a link to a movie request and send email
-app.post('/add-link', isAuthenticated, (req, res) => {
+app.post('/add-link', isAuthenticatedAdmin, (req, res) => {
     const { id, link } = req.body;
     db.run(`UPDATE requests SET link = ?, status = 'completed' WHERE id = ?`, [link, id], function(err) {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
+        if (err) return res.status(500).send('Database error.');
         db.get('SELECT movie_name, user_email FROM requests WHERE id = ?', [id], (err, row) => {
-            if (err || !row) {
-                console.error(err?.message || 'Email not found.');
-                return res.redirect('/admin');
-            }
+            if (err || !row) return res.redirect('/admin');
             const mailOptions = {
-                from: 'your_email@gmail.com',
+                from: process.env.GMAIL_USER,
                 to: row.user_email,
                 subject: `Your movie request for "${row.movie_name}" is ready!`,
-                html: `
-                    <p>Hi there,</p>
-                    <p>Good news! Your requested movie, <b>${row.movie_name}</b>, is now available.</p>
-                    <p>You can find the direct download link here: <a href="${link}">${link}</a></p>
-                    <p>Enjoy the movie!</p>
-                    <p>Best regards,<br>PH Movies</p>
-                `
+                html: `<p>Good news! Your requested movie, <b>${row.movie_name}</b>, is now available. You can find the direct download link here: <a href="${link}">${link}</a></p>`
             };
             transporter.sendMail(mailOptions, (error, info) => {
-                if (error) {
-                    console.error('Error sending email:', error);
-                } else {
-                    console.log('Email sent:', info.response);
-                }
+                if (error) console.error('Error sending email:', error);
+                else console.log('Email sent:', info.response);
             });
             res.redirect('/admin');
         });
     });
 });
 
-// Route to update request status
-app.post('/update-status', isAuthenticated, (req, res) => {
-    const requestId = req.body.id;
+app.post('/update-status', isAuthenticatedAdmin, (req, res) => {
+        const requestId = req.body.id;
     const sql = `UPDATE requests SET status = 'completed' WHERE id = ?`;
     db.run(sql, [requestId], function(err) {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
-        console.log(`Request ${requestId} marked as completed.`);
+        if (err) return res.status(500).send('Database error.');
         res.redirect('/admin');
     });
 });
 
-// Route to delete a request
-app.post('/delete-request', isAuthenticated, (req, res) => {
+app.post('/delete-request', isAuthenticatedAdmin, (req, res) => {
     const requestId = req.body.id;
     const sql = `DELETE FROM requests WHERE id = ?`;
     db.run(sql, [requestId], function(err) {
-        if (err) {
-            console.error(err.message);
-            return res.status(500).send('Database error.');
-        }
-        console.log(`Request ${requestId} deleted.`);
+        if (err) return res.status(500).send('Database error.');
         res.redirect('/admin');
     });
 });
 
-// Logout route
-app.get('/logout', (req, res) => {
-    req.session.destroy();
-    res.redirect('/login');
+app.get('/admin/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) return console.error(err);
+        res.redirect('/admin/login');
+    });
+});
+
+// --- Movie Request Route ---
+app.post('/request-movie', isAuthenticatedUser, (req, res) => {
+    const movieName = req.body.movieName;
+    const userEmail = req.session.userEmail;
+
+    const sql = `INSERT INTO requests(movie_name, user_email) VALUES(?, ?)`;
+    db.run(sql, [movieName, userEmail], function(err) {
+        if (err) return res.status(500).send('Database error.');
+        res.send('Request submitted successfully!');
+    });
 });
 
 // Start the server
